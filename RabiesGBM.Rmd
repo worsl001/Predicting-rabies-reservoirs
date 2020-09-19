@@ -1,0 +1,171 @@
+---
+title: "Using host traits to predict reservoir host species of rabies virus"
+author: "Worsley-Tonks KEL, Escobar LE, Biek R, Castaneda-Guzman M, Craft ME, Streicker DG, White LA, Fountain-Jones NM"
+date: "9/2020"
+output: html_document
+---
+
+### Load data, specify class and factors
+```{r}
+#rabv <- read.csv("rabies_classification_and_traits_carnivores_092020.csv", row.names=1,head=T)
+rabv <- read.csv("rabies_classification_and_traits_bats_092020.csv", row.names=1,head=T)
+
+colnames(rabv)[1] <- "Class"
+rabv$liberal <- NULL
+#rabv$conservative <- NULL
+```
+
+##### For carnivore dataset
+```{r}
+rabv$mono.poly <- as.factor(rabv$mono.poly)
+rabv$Social <- as.factor(rabv$Social)
+rabv$ActivityCycle <- as.factor(rabv$ActivityCycle)
+rabv$DietBreadth <- as.factor(rabv$DietBreadth)
+rabv$HabitatBreadth <- as.factor(rabv$HabitatBreadth)
+```
+
+##### For bat dataset
+```{r}
+rabv$LitterSize <- as.factor(rabv$LitterSize)
+rabv$DietBreadth <- as.factor(rabv$DietBreadth)
+```
+
+### Split data into training and testing sets
+```{r}
+#library("dplyr")
+library("caret")
+set.seed(190)  
+partition= createDataPartition(y=rabv$Class, p = 0.8, list = FALSE, times = 1)  
+training_pred <- rabv[partition,-1]
+training_class <- rabv[partition,1]
+testing_pred <- rabv[-partition,-1]
+testing_class <- rabv[-partition,1]
+```
+
+### Create folds for CV, performing downsample of majority class
+```{r}
+source("functionsCV.R")
+set.seed(130) 
+myFoldsDownSample <- CreateBalancedMultiFolds(y=training_class,k=10,times=10) 
+```
+
+### Set up re-sampling approach
+```{r}
+myControlDownSample <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 10,              
+  index = myFoldsDownSample,
+  savePredictions=TRUE,        
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,  
+  allowParallel=TRUE,
+  selectionFunction = "best")
+```
+
+### set up GBM tuning parameters
+```{r}
+library("gbm") 
+gbm.grid <- expand.grid(interaction.depth = c(1, 3, 5, 7, 9), 
+                        n.trees = (1:30)*500,          
+                        shrinkage = 0.01,  
+                        n.minobsinnode = 5) 
+
+set.seed(999) 
+gbm <- train(training_pred, training_class,
+             method = "gbm",
+             metric = "ROC",
+             verbose = FALSE,
+             trControl = myControlDownSample,   
+             tuneGrid = gbm.grid)
+```
+
+### Estimate model performance in terms of a confusion matrix from repeated cross-validation
+```{r}
+source("performance_functions.R")
+oof <- gbm$pred
+oof <- oof[intersect(which(oof$n.trees==gbm$bestTune[,'n.trees']),which(oof$interaction.depth==gbm$bestTune[,'interaction.depth'])),] # this is considering only the best fit model
+repeats <- gbm$control$repeats
+gbm.performance.cv <- EstimatePerformanceCV(oof=oof,repeats=repeats)
+gbm.performance.cv
+```
+
+### Estimate error rates from repeated cross-validation
+```{r}
+gbm.error.cv <- EstimateErrorRateCV(oof=oof,repeats=repeats)
+gbm.error.cv 
+```
+
+### Variable importance 
+```{r}
+library("iml") 
+X <-rabv[-which(names(rabv) == "Class")]
+Y <- rabv$Class
+set.seed(123)
+mod <- Predictor$new(gbm, data = X, y=Y, type='prob') 
+imp <-FeatureImp$new(mod, loss= "ce", compare = "ratio", n.repetitions = 100)
+imp.dat<- imp$results
+imp.dat <- as.data.frame(imp.dat)
+plot(imp) 
+```
+
+### Partial dependence plot
+```{r}
+library("pdp")
+library("ggplot2")
+topPred <- imp.dat$feature[1:3]
+ice_curves <- lapply(topPred, FUN = function(x) {
+cice <- partial(gbm, pred.var = x, center = FALSE, ice = TRUE, which.class="Positive", prob = F) 
+autoplot(cice, rug = TRUE, train = rabv, alpha = 0.05) +
+theme_bw() +
+theme(axis.text.y = element_text(size=12, face="bold", colour = "black"),
+axis.text.x = element_text(size=12, face="bold", colour = "black"), axis.title.x = element_text(size=14, face="bold", colour = "black"),
+axis.title.y = element_text(size=14, face="bold", colour = "black")) +
+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black")) + ylab("c-ICE") + ggtitle(x)
+})
+
+Categorical <- "LitterSize"
+ice_curves2 <- lapply(Categorical, FUN = function(x) {
+ice <- partial(gbm, pred.var =  'LitterSize', ice = TRUE, center = FALSE, which.class="Positive", prob = F)
+ggplot(ice, rug=T, train = rabv, aes(x=LitterSize, y = yhat, group = LitterSize)) + geom_boxplot()+theme_bw() +
+theme(axis.text.y = element_text(size=12, face="bold", colour = "black"),
+axis.text.x = element_text(size=12, face="bold", colour = "black"), axis.title.x = element_text(size=14, face="bold", colour = "black"),
+axis.title.y = element_text(size=14, face="bold", colour = "black")) +
+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black")) 
+})
+grid.arrange(grobs = c(ice_curves, ice_curves2), ncol = 2)
+
+```
+
+
+### Shapley value
+##### For one species
+```{r}
+set.seed(123)
+mod <- Predictor$new(gbm, data = X, y=Y, type='prob', class='Positive') 
+set.seed(224)
+shapley = Shapley$new(mod, x.interest = X[4,], sample.size = 1000) 
+p <- shapley$plot()
+p
+results = shapley$results
+sumshapley <- sum(results$phi)
+sumshapley
+```
+
+##### For all species
+```{r}
+library("magicfor")             
+magic_for(print, silent = TRUE) 
+for (i in 1:nrow(rabv)) {
+  set.seed(224)
+  shapley = Shapley$new(mod, x.interest = X[i,], sample.size = 1000)
+  results = shapley$results
+  sumshapley <- sum(results$phi)
+  print(sumshapley)
+}
+options(max.print=100000)
+c <- magic_result_as_dataframe()  
+species <- as.data.frame(cbind(row.names(X), c))
+print(species)
+```
